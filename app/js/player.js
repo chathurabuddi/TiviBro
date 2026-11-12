@@ -4,6 +4,7 @@
    Engines
      ts     mpegts.js in a worker   (raw MPEG-TS, most Xtream live)
      hls    hls.js in a worker      (.m3u8)
+     dash   Shaka Player            (.mpd, and channels protected with a license server)
      native the TV's own pipeline   (zero JS demux cost, least control, ignores CORS)
 
    Smoothness layers
@@ -121,8 +122,12 @@ var Player = (function () {
   function hostOf(url) { var m = /^https?:\/\/([^/]+)/i.exec(url); return m ? m[1] : ''; }
   function mse() { return !!(window.MediaSource && MediaSource.isTypeSupported && MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E,mp4a.40.2"')); }
 
+  /* MPEG-DASH: an address ending .mpd, or a channel whose playlist says so ("#KODIPROP" lines, plshape.js).
+     The TV's own player has no DASH, so these have one pipeline of their own. */
+  function isDash(url) { return /\.mpd(\?|#|$)/i.test(url || '') || !!(cur && cur.ch && cur.ch.mt === 'mpd' && !cur.conv && !cur.timeshift); }
   function pickEngine(url) {
     var s = Store.settings.engine;
+    if (isDash(url) && mse()) return 'dash';
     var isHls = /\.m3u8(\?|$)/i.test(url);
     // Files (movies, episodes) belong to the TV's own player: it seeks and handles MKV/MP4 natively.
     if (cur && !cur.live && !cur.timeshift && !isHls && !/\.ts(\?|$)/i.test(url)) return 'native';
@@ -230,6 +235,127 @@ var Player = (function () {
       destroy: function () { try { h.destroy(); } catch (e) {} }
     };
   }
+
+  /* MPEG-DASH and protected channels (discussion #79).  LG's TV player has no DASH, and offers Widevine and
+     PlayReady to apps only through the browser's own protected player (MSE and EME), so these play with Shaka
+     Player (vendor/shaka-player.dash.js, 630 KB): loaded the first time such a channel starts, not at launch.
+     Every request goes through the helper like the other pipelines'; a protected channel's license request
+     goes to the server its playlist names, the way the playlist asks (drm.js).  Shaka never starts playback
+     itself: the watchdog below does, as for the other pipelines. */
+  var shakaLoading = null;
+  function loadShaka() {
+    if (window.shaka) return Promise.resolve();
+    if (!shakaLoading) shakaLoading = new Promise(function (res, rej) {
+      var s = document.createElement('script');
+      s.src = 'vendor/shaka-player.dash.js';
+      s.onload = function () {
+        try { shaka.polyfill.installAll(); } catch (e) {}
+        /* Keys written in the playlist itself (ClearKey): Shaka hands them to the browser as a "data:" address,
+           which its DASH-only build can't read by itself. */
+        shaka.net.NetworkingEngine.registerScheme('data', function (uri) {
+          var m = /^data:[^,]*?(;base64)?,(.*)$/.exec(uri), text = m ? (m[1] ? atob(m[2]) : decodeURIComponent(m[2])) : '';
+          return shaka.util.AbortableOperation.completed({ uri: uri, originalUri: uri, data: shaka.util.StringUtils.toUTF8(text), headers: {} });
+        });
+        res();
+      };
+      s.onerror = function () { shakaLoading = null; rej(new Error('the DASH player could not be loaded')); };
+      document.head.appendChild(s);
+    });
+    return shakaLoading;
+  }
+  /** Why this channel can't play here at all, known before anything loads; '' when it can be tried. */
+  function protectedWhy(kind) {
+    var ch = cur && cur.ch;
+    if (!ch || !ch.lt || cur.conv || cur.timeshift) return '';
+    var info = Drm.parse(ch.lt, ch.lk);
+    if (info.error) return info.error + '.';
+    if (kind !== 'dash') return 'This channel is protected (' + info.name + '), and TiviBro can only play protected channels that are MPEG-DASH.';
+    if (!Drm.possible()) return 'This channel is protected (' + info.name + '), and this TV does not let apps play protected channels.';
+    return '';
+  }
+  function drmWhy(err, info) {
+    var C = shaka.util.Error.Code, name = info ? info.name : 'a way', inner = err.data && err.data[0], status = inner && inner.code === C.BAD_HTTP_STATUS ? +inner.data[1] || 0 : 0;
+    switch (err.code) {
+      case C.NO_RECOGNIZED_KEY_SYSTEMS: case C.REQUESTED_KEY_SYSTEM_CONFIG_UNAVAILABLE: case C.FAILED_TO_CREATE_CDM: case C.FAILED_TO_ATTACH_TO_VIDEO: case C.FAILED_TO_CREATE_SESSION:
+        return 'This channel is protected (' + name + '), and this TV does not let TiviBro play that.';
+      case C.LICENSE_REQUEST_FAILED:
+        return 'The license server for this channel did not give TiviBro a key' + (status ? ' (error ' + status + ')' : '') + '.  Press OK to try again, or ask your provider.';
+      case C.LICENSE_RESPONSE_REJECTED:
+        return 'This TV did not accept the key the license server sent for this channel.';
+      case C.ENCRYPTED_CONTENT_WITHOUT_DRM_INFO: case C.NO_LICENSE_SERVER_GIVEN:
+        return 'This channel is protected and its playlist gives no license server.';
+      case C.EXPIRED:
+        return 'The key for this channel ran out.  Press OK to play it again.';
+    }
+    return 'This protected channel could not be opened (error ' + err.code + ').';
+  }
+  function dashEngine(url, p, fail, blocked, tracks) {
+    var pw = plWrap(), ch = cur.ch, info = ch && ch.lt ? Drm.parse(ch.lt, ch.lk) : null, sp = null, gone = false, reported = false;
+    function onError(err) {
+      if (gone || reported || !err) return;
+      if (!err.code) { reported = true; return fail('media', err.message || String(err)); }
+      var E = shaka.util.Error, d = err.data || [];
+      if (err.severity !== E.Severity.CRITICAL) return;
+      reported = true;
+      if (err.category === E.Category.DRM) return blocked(drmWhy(err, info), err.code + (d[0] && d[0].code ? ', ' + d[0].code : typeof d[0] === 'string' ? ', ' + d[0].slice(0, 80) : ''));
+      if (err.code === E.Code.BAD_HTTP_STATUS) return fail('net', 'HTTP ' + d[1], false, false, +d[1] || 0);
+      if (err.category === E.Category.NETWORK) return fail('net', 'DASH network error ' + err.code, err.code === E.Code.HTTP_ERROR);
+      fail('media', 'DASH error ' + err.code);
+    }
+    function variants() { return sp ? sp.getVariantTracks() : []; }
+    function qualities() {
+      var seen = {}, out = [];
+      variants().forEach(function (t) { if (t.height && !seen[t.height]) { seen[t.height] = 1; out.push(t); } });
+      return out.sort(function (a, b) { return a.height - b.height; });
+    }
+    loadShaka().then(function () {
+      if (gone) return;
+      sp = new shaka.Player();
+      sp.addEventListener('error', function (e) { onError(e.detail); });
+      var net = sp.getNetworkingEngine(), LICENSE = shaka.net.NetworkingEngine.RequestType.LICENSE;
+      net.registerRequestFilter(function (type, req) {
+        if (type !== LICENSE) { req.uris = req.uris.map(function (u) { return Net.wrap(u, pw); }); return; }
+        if (!info || !info.url) return;                     // keys from the playlist: no server to ask
+        var a = Drm.ask(info, shaka.util.BufferUtils.toUint8(req.body));
+        req.uris = [a.url]; req.headers = a.headers; req.method = 'POST';
+        req.body = typeof a.body === 'string' ? shaka.util.StringUtils.toUTF8(a.body) : a.body;
+      });
+      net.registerResponseFilter(function (type, res) {
+        if (type === LICENSE && info && info.url) res.data = shaka.util.BufferUtils.toArrayBuffer(Drm.license(info, shaka.util.BufferUtils.toUint8(res.data)));
+      });
+      var drm = {};
+      if (info && info.keys) drm.clearKeys = info.keys;
+      else if (info) { drm.servers = {}; drm.servers[info.system] = info.url; }
+      sp.configure({ streaming: { bufferingGoal: p.ahead, bufferBehind: p.back }, drm: drm });
+      return sp.attach(video).then(function () { if (!gone) return sp.load(url, null, 'application/dash+xml'); });
+    }).then(function () { if (!gone && st) { st.gotInfo = true; tracks(); } }, onError);
+    return {
+      name: 'DASH',
+      recover: function () { try { if (sp) sp.retryStreaming(); } catch (e) {} },
+      info: function () { var s = sp && sp.getStats(); return s && s.streamBandwidth ? Math.round(s.streamBandwidth / 1000) + ' kbps' : ''; },
+      audio: function () { return (sp ? sp.getAudioTracks() : []).map(function (t, i) { return { id: i, label: t.label || t.language || ('Track ' + (i + 1)), lang: t.language || '', ch: +t.channelsCount || 0, on: !!t.active }; }); },
+      setAudio: function (i) { var t = sp && sp.getAudioTracks()[i]; if (t) sp.selectAudioTrack(t); },
+      levels: function () { var auto = sp && sp.getConfiguration().abr.enabled; return qualities().map(function (t, i) { return { id: i, label: t.height + 'p' + (t.videoBandwidth ? '  ' + (t.videoBandwidth / 1e6).toFixed(1) + ' Mbps' : ''), on: !auto && !!t.active }; }); },
+      auto: function () { return !sp || sp.getConfiguration().abr.enabled; },
+      setLevel: function (i) {
+        if (!sp) return;
+        var t = qualities()[i];
+        sp.configure({ abr: { enabled: !t } });
+        if (t) sp.selectVariantTrack(t, true);
+      },
+      edge: function () { if (sp && sp.isLive() && video.currentTime < sp.seekRange().end - 30) sp.goToLive(); },
+      /* Shaka lets go of the video a moment after it is told to, and clears the video's address when it does:
+         the next player waits for that (dashClosing, in start), or it would lose the stream it just opened. */
+      destroy: function () {
+        gone = true;
+        if (!sp) return;
+        var done = function () { if (dashClosing === closing) dashClosing = null; }, closing;
+        try { closing = dashClosing = Promise.race([sp.destroy().then(done, done), new Promise(function (r) { setTimeout(r, 3000); }).then(done)]); } catch (e) {}
+        sp = null;
+      }
+    };
+  }
+  var dashClosing = null;
 
   function tsEngine(url, p, preview, fail, media) {
     var live = cur.live || !!cur.timeshift;
@@ -438,6 +564,7 @@ var Player = (function () {
     if (myToken !== token || !cur) return;
     clearTimeout(cur.timer);
     teardown();
+    if (dashClosing) return void dashClosing.then(function () { start(myToken); });
     if (cur.urlFn) { cur.url = cur.urlFn(); cur.pos = 0; }  // catch-up: every reconnect resumes where playback got to
     var url = cur.url, p = cur.p, conv = cur.conv;
     var kind = cur.forceKind || (cur.forceNative ? 'native' : pickEngine(url));
@@ -449,10 +576,12 @@ var Player = (function () {
       kind = conv.fmt === 'ts' && window.mpegts && mse() && Caps.probe().mse.ac3 ? 'ts' : 'native';
     }
     // Known codecs up front (a movie's details): route before anything loads.
-    if (!conv && !cur.forceKind && !cur.forceNative && kind !== 'native' && cur.media && !cur.routed) {
+    if (!conv && !cur.forceKind && !cur.forceNative && kind !== 'native' && kind !== 'dash' && cur.media && !cur.routed) {
       var r0 = Caps.route(cur.media, hdrPolicy());
       if (r0.engine === 'native') { cur.routed = true; Log.info('player', r0.reason); useEngine('native'); kind = 'native'; }
     }
+    var why = conv ? '' : protectedWhy(kind);
+    if (why) { Log.warn('player', 'Protected channel can\'t be played: ' + why); cur.blocked = why; cur.everPlayed = false; cur.tried = cur.tried || {}; cur.tried[kind] = 1; return giveUp(myToken); }
     Log.state('player', 'playing ' + (cur.ch && cur.ch.n ? '"' + cur.ch.n + '"' : 'a video') + ' with the ' + kind + ' engine');
     Log.info('player', 'Start ' + (cur.ch && cur.ch.n ? '"' + cur.ch.n + '" ' : '') + 'with ' + kind + ' engine' + (kind !== 'native' && Net.active ? ' via helper' : '') + ', profile ' + p.label + ' (prebuffer ' + p.prebuffer + 's)' + (cur.retries ? ', attempt ' + (cur.retries + 1) : '') + (cur.startAt ? ', from ' + Math.round(cur.startAt) + 's' : '') + (conv ? ', sound converted from ' + Math.round(conv.t) + 's' : '') + '  ' + (conv ? cur.url : url));
     var gen = cur.gen = (cur.gen || 0) + 1;     // a torn-down engine's late events are ignored
@@ -519,6 +648,13 @@ var Player = (function () {
       if (ended && st.started && bufferedAhead() > 4) { st.pendingReconnect = true; Log.info('player', 'Provider closed the stream; playing the remaining ' + bufferedAhead().toFixed(1) + 's then reconnecting'); return; }
       reconnect(myToken, ended ? 'Stream ended, reconnecting' : busyHttp(http) ? 'Provider busy (still counting the last channel), trying again' : 'Connection dropped, reconnecting');
     };
+    // A protected channel the TV, or its license server, refused: said as it is, not retried as a dropped connection.
+    var blocked = function (why, code) {
+      if (myToken !== token || gen !== cur.gen) return;
+      Log.warn('player', 'Protected channel refused (' + code + '): ' + why);
+      cur.blocked = why; cur.tried = cur.tried || {}; cur.tried.dash = 1;
+      giveUp(myToken);
+    };
     // Codec facts from the stream itself, before the first frame: the HLS master playlist or the
     // TS demuxer's media info.  Switch pipeline once if the stream belongs on the TV player.
     var media = function (m) {
@@ -547,6 +683,7 @@ var Player = (function () {
     try {
       if (kind === 'hls') eng = hlsEngine(url, p, cur.preview, fail, media, tracks);
       else if (kind === 'ts') eng = tsEngine(url, p, cur.preview, fail, media);
+      else if (kind === 'dash') eng = dashEngine(url, p, fail, blocked, tracks);
       else eng = nativeEngine(url, tracks, conv);
     } catch (e) {
       Log.warn('player', kind + ' engine could not start: ' + e.message);
@@ -619,11 +756,15 @@ var Player = (function () {
   /* Before the first frame each pipeline gets one try: built-in demuxer (ts), the TV player
      (native, decodes AC-3 and raw TS), and for Xtream live channels the provider's HLS version
      of the same channel.  Once all have failed there is no point in eight reconnects. */
-  var ENGINE_NAMES = { ts: 'built-in demuxer', native: 'TV player', hls: 'HLS version of this channel' };
+  var ENGINE_NAMES = { ts: 'built-in demuxer', native: 'TV player', hls: 'HLS version of this channel', dash: 'DASH player' };
+  /* A DASH channel's pipelines: its own, then the TV player for one that isn't protected (a few TVs may
+     play it); a protected one has no other. */
+  function dashOrder() { return cur.ch && cur.ch.lt ? ['dash'] : ['dash', 'native']; }
   function hlsVariant(url) { return cur && cur.live && !cur.timeshift && /\/live\/[^?]+\.ts(\?|$)/i.test(url) ? url.replace(/\.ts(\?|$)/i, '.m3u8$1') : null; }
   /** Can this TV use pipeline [k] for the current channel? */
   function engineOk(k) {
     var u = cur.origUrl || cur.url, isHlsUrl = /\.m3u8(\?|$)/i.test(u);
+    if (isDash(u)) return dashOrder().indexOf(k) >= 0 && (k === 'native' || mse());
     if (k === 'native') return true;
     if (k === 'ts') return !isHlsUrl && !!(window.mpegts && mse());
     if (k === 'hls') return !!(window.Hls && Hls.isSupported() && (isHlsUrl || hlsVariant(u)));
@@ -635,10 +776,11 @@ var Player = (function () {
     cur.tried = cur.tried || {};
     cur.tried[failed] = 1;
     var isHlsUrl = /\.m3u8(\?|$)/i.test(cur.url);
-    var order = isHlsUrl ? ['hls', 'native'] : ['ts', 'native', 'hls'];
+    var order = isDash(cur.origUrl || cur.url) ? dashOrder() : isHlsUrl ? ['hls', 'native'] : ['ts', 'native', 'hls'];
     for (var i = 0; i < order.length; i++) {
       var k = order[i];
       if (cur.tried[k]) continue;
+      if (k === 'dash' && !mse()) continue;
       if (cur.late && cur.late[k]) continue;      // it already showed no picture for this channel (issue #73)
       if (k === 'ts' && !(window.mpegts && mse())) continue;
       if (k === 'hls' && !(window.Hls && Hls.isSupported() && (isHlsUrl || hlsVariant(cur.origUrl || cur.url)))) continue;
@@ -664,6 +806,7 @@ var Player = (function () {
     if (cur.live && !cur.timeshift && !cur.deadCounted && window.DeadList) { cur.deadCounted = cur.deadFailed = true; try { DeadList.failed(cur.ch, cur.origUrl || cur.url, cur.lastHttp || 0); } catch (e) {} }
     // A movie that was playing here a moment ago is not a format the TV can't decode (issue #34).
     if (isFile() && cur.everPlayed) return state('error', CLOSED);
+    if (cur.blocked) return state('error', cur.blocked);
     if (cur.lastHttp) return state('error', 'The provider is not sending this ' + (isFile() ? 'video' : 'channel') + ' right now (error ' + cur.lastHttp + ').  Press OK to try again, or try ' + (isFile() ? 'again later.' : 'another channel.'));
     state('error', isFile() ? 'This video will not play on this TV.  It may use a format the TV cannot decode.' : 'This channel will not play on this TV.  It may use a format the TV cannot decode, or the provider may be having trouble with it.');
   }
@@ -682,7 +825,7 @@ var Player = (function () {
     cur.late[failed] = 1;
     var isHlsUrl = /\.m3u8(\?|$)/i.test(cur.origUrl || cur.url);
     // After a channel has played, a pipeline failing is mostly the connection: its HLS version before the TV player.
-    var order = isHlsUrl ? ['hls', 'native'] : !format && cur.live && !cur.timeshift && cur.everPlayed && hlsVariant(cur.origUrl || cur.url) ? ['ts', 'hls', 'native'] : ['ts', 'native', 'hls'];
+    var order = isDash(cur.origUrl || cur.url) ? dashOrder() : isHlsUrl ? ['hls', 'native'] : !format && cur.live && !cur.timeshift && cur.everPlayed && hlsVariant(cur.origUrl || cur.url) ? ['ts', 'hls', 'native'] : ['ts', 'native', 'hls'];
     for (var i = 0; i < order.length; i++) {
       var k = order[i];
       if (cur.late[k] || (cur.bad && cur.bad[k])) continue;
@@ -693,6 +836,7 @@ var Player = (function () {
          played it in 2 s afterwards). */
       if (cur.tried && cur.tried[k] && !(k === 'native' && format && !cur.nativeAgain)) continue;
       if (k === 'ts' && !(window.mpegts && mse())) continue;
+      if (k === 'dash' && !mse()) continue;
       if (k === 'hls' && !(window.Hls && Hls.isSupported() && (isHlsUrl || hlsVariant(cur.origUrl || cur.url)))) continue;
       if (k === 'native' && cur.tried && cur.tried.native) cur.nativeAgain = 1;
       return k;
@@ -825,7 +969,7 @@ var Player = (function () {
     while (arr.length > 2 && now - arr[1][0] >= EARLY_WIN) arr.shift();
     if (now - arr[0][0] < EARLY_WIN || now - (cur.earlyAt || 0) < EARLY_EVERY || now - st.at < EARLY_WIN) return false;
     // An HLS stream with several qualities lowers its own quality instead.
-    if (st.kind === 'hls' && eng && eng.levels && eng.levels().length > 1 && eng.auto && eng.auto()) return false;
+    if ((st.kind === 'hls' || st.kind === 'dash') && eng && eng.levels && eng.levels().length > 1 && eng.auto && eng.auto()) return false;
     var rate = (end - arr[0][1]) / ((now - arr[0][0]) / 1000);
     if (rate >= EARLY_RATE || rate < 0.05 || ahead > Math.max(2.5, p.refill) || ahead < 0.8) return false;
     // A trickle, not a stall: something arrived at least every few seconds the whole time.
@@ -909,7 +1053,7 @@ var Player = (function () {
         // this same session (OK on "try again", or it came back by itself), not only on the first start (#36).
         if (cur.live && (!cur.everPlayed || cur.deadFailed) && window.DeadList) { DeadList.played(cur.ch, cur.origUrl || cur.url); cur.deadFailed = false; }
         if (cur.swapFrom) cur.swapPlayed = true;
-        cur.slow = ''; cur.everPlayed = true; cur.failed = false; cur.httpFails = 0; cur.lastHttp = 0; cur.starved = false; cur.lastFailHttp = false;
+        cur.slow = ''; cur.everPlayed = true; cur.failed = false; cur.blocked = ''; cur.httpFails = 0; cur.lastHttp = 0; cur.starved = false; cur.lastFailHttp = false;
         cur.startMs = now - st.at; cur.dataMs = st.tData ? st.tData - st.at : 0; cur.picMs = st.tPic ? st.tPic - st.at : 0;
         if (window.ProvStatus) ProvStatus.note(cur.origUrl || cur.url, true);
         Log.info('player', 'Playing after ' + (now - st.at) + 'ms with ' + ahead.toFixed(1) + 's buffered' + (ahead < p.prebuffer ? ' (prebuffer timed out)' : '') + (video.videoHeight ? ', ' + video.videoWidth + 'x' + video.videoHeight : '') +

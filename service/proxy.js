@@ -28,6 +28,7 @@ var Media = require('./media');
 var Convert = require('./convert');
 var Ffmpeg = require('./ffmpeg');
 var Pace = require('./pace');
+var License = require('./license');
 
 /* DNS answers.  Node asks the system for every new connection, and each channel start (and each
    redirect to a provider's streaming server) is a new connection; on a TV with a slow resolver that is
@@ -228,7 +229,7 @@ function create(opts) {
        TV the helper hands TiviBro a secret with its start reply (service.js, over luna, which only
        TiviBro may call); without it, a web page in the TV's browser could reach these over localhost. */
     var ctlRoute = req.url.indexOf('/editor/') === 0 ? 'editor' : req.url.indexOf('/companion/') === 0 ? 'companion' : req.url.indexOf('/kv/') === 0 ? 'kv' : req.url.indexOf('/live/') === 0 ? 'live' : req.url.indexOf('/media/') === 0 ? 'media' :
-      req.url.indexOf('/convert/') === 0 ? 'convert' : req.url.indexOf('/ffmpeg/') === 0 ? 'ffmpeg' : '';
+      req.url.indexOf('/convert/') === 0 ? 'convert' : req.url.indexOf('/ffmpeg/') === 0 ? 'ffmpeg' : req.url.indexOf('/license/') === 0 ? 'license' : '';
     if (ctlRoute) {
       res.setHeader('Access-Control-Allow-Origin', '*');
       if (opts.ctl && !sameText(req.headers['x-tivibro-ctl'], opts.ctl)) { res.writeHead(403, { 'Content-Type': 'application/json' }); return res.end('{"error":"not allowed"}'); }
@@ -238,6 +239,7 @@ function create(opts) {
       if (ctlRoute === 'media') return Media.handle(req, res, ALLOW, log);
       if (ctlRoute === 'convert') return Convert.control(req, res, ALLOW, log, ownPort(), redact);
       if (ctlRoute === 'ffmpeg') return Ffmpeg.handle(req, res, ALLOW);
+      if (ctlRoute === 'license') return License.handle(req, res, ALLOW, log);
       if (!opts.companion) { res.writeHead(404, { 'Content-Type': 'application/json' }); return res.end('{"error":"no phone app connection in this helper"}'); }
       return opts.companion.control(req, res, req.url.split('?')[0]);
     }

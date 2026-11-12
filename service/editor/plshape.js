@@ -108,9 +108,23 @@ var PlShape = (function () {
     }
     return out;
   }
+  /* "#KODIPROP:name=value" lines, the Kodi and TiviMate way to say how a channel plays.  They stand before
+     or after the channel's #EXTINF line.  Kept with the channel, only when given:
+       mt  'mpd'  the address is an MPEG-DASH manifest (also known from an address ending .mpd)
+       lt  the protection, as the playlist names it ("com.widevine.alpha", "clearkey"...)
+       lk  where the key comes from: Kodi's "address|headers|what to send|how the answer reads" (drm.js)
+     The newer "drm_legacy=protection|address|headers" gives the same two. */
+  var KODI = 'inputstream.adaptive.';
+  function kodi(ch, props) {
+    var mt = (props[KODI + 'manifest_type'] || '').toLowerCase();
+    if (mt === 'mpd' || mt === 'dash' || /^application\/dash\+xml/i.test(props.mimetype || '')) ch.mt = 'mpd';
+    var lt = props[KODI + 'license_type'] || '', lk = props[KODI + 'license_key'] || '', legacy = props[KODI + 'drm_legacy'] || '';
+    if (!lt && legacy) { var bar = legacy.indexOf('|'); lt = bar < 0 ? legacy : legacy.slice(0, bar); lk = bar < 0 ? '' : legacy.slice(bar + 1); }
+    if (lt) { ch.lt = lt.toLowerCase(); if (lk) ch.lk = lk; }
+  }
   function parseM3U(text, opts) {
     var lib = opts && opts.vod ? library() : null;
-    var groups = [], gmap = {}, chans = [], cur = null, epgUrl = '';
+    var groups = [], gmap = {}, chans = [], cur = null, props = null, epgUrl = '';
     var nl0 = text.indexOf('\n'), head = nl0 < 0 ? text : text.slice(0, nl0);
     var m = head.match(/(?:url-tvg|x-tvg-url)="([^"]+)"/);
     if (m) epgUrl = m[1].split(',')[0];
@@ -133,9 +147,14 @@ var PlShape = (function () {
           while ((a = ATTR.exec(meta))) cur.attrs[a[1].toLowerCase()] = a[2];
         } else if (L.indexOf('#EXTGRP:') === 0 && cur) {
           cur.attrs['group-title'] = cur.attrs['group-title'] || L.slice(8).trim();
+        } else if (L.indexOf('#KODIPROP:') === 0) {
+          var eq = L.indexOf('=');
+          if (eq > 10) { props = props || {}; props[L.slice(10, eq).trim().toLowerCase()] = L.slice(eq + 1).trim(); }
         }
         continue;
       }
+      var kp = props;
+      props = null;
       if (cur) {
         var url = L.trim(), opt = options(url);
         if (opt) url = opt.url;
@@ -155,6 +174,7 @@ var PlShape = (function () {
           cu: cur.attrs['catchup'] || cur.attrs['catchup-type'] || '', cus: cur.attrs['catchup-source'] || ''
         };
         if (opt && opt.ua) ch.ua = opt.ua;
+        if (kp) kodi(ch, kp);
         chans.push(ch);
         cur = null;
       }

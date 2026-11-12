@@ -144,9 +144,10 @@ var Net = (function () {
   function uaPrefix(u) {
     if (u === undefined) u = ua();
     if (!u) return '';
-    if (uaCache.ua !== u) { uaCache.ua = u; uaCache.p = '/ua/' + btoa(unescape(encodeURIComponent(u))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
+    if (uaCache.ua !== u) { uaCache.ua = u; uaCache.p = '/ua/' + b64u(u); }
     return uaCache.p;
   }
+  function b64u(s) { return btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); }
   function unwrap(url) {
     var m = /^http:\/\/127\.0\.0\.1:\d+(?:\/ua\/[A-Za-z0-9_-]+)?(?:\/unz\/[A-Za-z0-9_-]+)?\/x\/(https?)\/(.*)$/.exec(url || '');
     return m ? m[1] + '://' + m[2] : url;
@@ -157,6 +158,9 @@ var Net = (function () {
     // Guides: the helper unzips .gz on every TV.  Without it, only browsers with DecompressionStream can.
     get canUnzip() { return !!useRelay() || typeof DecompressionStream !== 'undefined'; },
     xfer: function (id) { return port ? 'http://127.0.0.1:' + port + '/xfer/' + id : ''; },
+    // Where to post a protected channel's license request (drm.js): the helper sends it on with these headers
+    // (service/license.js).  Empty without the helper.
+    license: function (url, headers) { return port ? 'http://127.0.0.1:' + port + '/license/post?u=' + b64u(url) + '&h=' + b64u(JSON.stringify(headers || {})) : ''; },
     // The helper's /ping answer: Node version, and sys { bootAt, power } (see service/proxy.js).
     get info() { return info; },
     // Headers for the helper's control routes (web editor, phone app connection): see service/proxy.js.

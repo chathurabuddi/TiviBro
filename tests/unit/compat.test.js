@@ -41,12 +41,12 @@ files('app/js').filter(f => !/compat\.js$/.test(f)).forEach(f => {
     });
   });
 });
-// Bundled players (hls.js, mpegts.js): plain ES5, and nothing Chromium 53 lacks unless compat.js
-// polyfills it (Object.entries/values, padStart/padEnd) or the library checks for it first.
-['app/vendor/hls.min.js', 'app/vendor/mpegts.js'].forEach(f => {
+// Bundled players (hls.js, mpegts.js, Shaka Player): plain ES5, and nothing Chromium 53 lacks unless compat.js
+// polyfills it (Object.entries/values, padStart/padEnd, trimStart/trimEnd) or the library checks for it first.
+['app/vendor/hls.min.js', 'app/vendor/mpegts.js', 'app/vendor/shaka-player.dash.js'].forEach(f => {
   const e = parses(f, 5); ok('Chromium 53 can parse ' + f, !e, e);
   const src = fs.readFileSync(path.join(ROOT, f), 'utf8');
-  const VENDOR_BANNED = /Object\.(fromEntries|hasOwn)\(|\.(flat|flatMap|matchAll|replaceAll|trimStart|trimEnd|toggleAttribute|replaceChildren)\(|\b(queueMicrotask|structuredClone|WeakRef)\b|Promise\.(allSettled|any)\(/g;
+  const VENDOR_BANNED = /Object\.(fromEntries|hasOwn)\(|\.(flat|flatMap|matchAll|replaceAll|toggleAttribute|replaceChildren)\(|\b(queueMicrotask|structuredClone|WeakRef)\b|Promise\.(allSettled|any)\(/g;
   const hits = (src.match(VENDOR_BANNED) || []);
   ok(f + ' uses no unpolyfilled API missing on Chromium 53', !hits.length, hits.slice(0, 5).join(' '));
   const gt = (src.match(/globalThis/g) || []).length, gtGuarded = (src.match(/typeof globalThis/g) || []).length;
@@ -109,12 +109,13 @@ ok('compat.js marks <html class="nogap"> when flex gap does not work', /\bnogap\
 {
   const ctx = vm.createContext({ document: fakeDoc(), setTimeout() {} });
   ctx.window = fakeWin(); ctx.addEventListener = ctx.window.addEventListener;
-  vm.runInContext('delete Object.entries; delete Object.values; delete String.prototype.padStart; delete String.prototype.padEnd;', ctx);
+  vm.runInContext('delete Object.entries; delete Object.values; delete String.prototype.padStart; delete String.prototype.padEnd; delete String.prototype.trimStart; delete String.prototype.trimEnd;', ctx);
   vm.runInContext(fs.readFileSync(path.join(ROOT, 'app/js/compat.js'), 'utf8'), ctx);
   const r = JSON.parse(vm.runInContext(`JSON.stringify({ e: Object.entries({ a: 1, b: 'x' }), v: Object.values({ a: 1, b: 2 }),
-    p: ['5'.padStart(2, '0'), '7'.padStart(3), 'abc'.padStart(2, '0'), 'x'.padEnd(4, 'ab'), 'x'.padStart(5, '')] })`, ctx));
+    p: ['5'.padStart(2, '0'), '7'.padStart(3), 'abc'.padStart(2, '0'), 'x'.padEnd(4, 'ab'), 'x'.padStart(5, '')], t: [' a '.trimStart(), ' a '.trimEnd()] })`, ctx));
   ok('Object.entries / Object.values polyfills', JSON.stringify(r.e) === '[["a",1],["b","x"]]' && r.v.join() === '1,2', JSON.stringify(r));
   ok('padStart / padEnd polyfills (used by mpegts.js for HEVC)', r.p.join('|') === '05|  7|abc|xaba|x', r.p.join('|'));
+  ok('trimStart / trimEnd polyfills (used by Shaka Player)', r.t.join('|') === 'a | a', r.t.join('|'));
 }
 // webOS 3 and older can't run the app: a plain message instead of a black screen.
 {

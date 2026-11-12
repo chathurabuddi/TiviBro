@@ -37,6 +37,10 @@ MediaSource's state, and `_onSourceBufferUpdateEnd` returns at once when the con
 
 Re-apply after upgrading mpegts.js.  `hls.min.js` (1.5.20) is unmodified.
 
+## shaka-player.dash.js
+
+Shaka Player 5.3.4 (Apache-2.0), `dist/shaka-player.dash.js` from npm, unchanged: the DASH-only build, compiled to ES5 (the `-es2021` files don't run on older TVs).  Plays MPEG-DASH channels and protected ones (`app/js/player.js`, `app/js/drm.js`).  Loaded the first time such a channel starts, not from `index.html`.  This build has no reader for `data:` addresses; `player.js` registers a small one for ClearKey keys written in a playlist.
+
 ## qrcode.js
 
 qrcode-generator 2.0.4 by Kazuhiko Arase (MIT), `dist/qrcode.js` from npm, unchanged.  Draws the QR code on the TV's first-run tour that opens the web editor on a phone.
