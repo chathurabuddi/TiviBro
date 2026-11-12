@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **MPEG-DASH channels play, and so do protected ones that name a license server (discussion #79).**  Some M3U playlists point each channel at a DASH address (`.mpd`) and say where its key comes from in `#KODIPROP` lines, the way Kodi and TiviMate read them.  TiviBro dropped those lines and tried such channels as MPEG-TS, so they never started.  They now play with a DASH player of their own, and a channel protected with Widevine, PlayReady or ClearKey asks the license server its playlist names, with the headers the playlist gives.  A channel that can't be played (a protection the TV doesn't offer to apps, a license server that refuses) says why on screen instead of "Provider busy".  Reload channels to pick it up.
 - **M3U channels with their own User-Agent play (issue #78).**  Some playlists end each channel's address with `|User-Agent=...`.  TiviBro sent that text as part of the address, so the provider answered with an error and every channel said "Provider busy".  The channel now uses that User-Agent and the address is sent clean.  Reload channels to pick it up.
 
 ## 0.6.0 (alpha 120, 2026-11-11)
